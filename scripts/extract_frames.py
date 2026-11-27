@@ -7,8 +7,9 @@
 2. 連續變動（動畫、捲動、載入中）合併成一次切換，取變動結束、畫面穩定後的時間點；第 0 秒必取。
 3. 偵測到的切換太少時，改用固定間隔補幀。
 4. 每個時間點擷取一張原尺寸 PNG；用同一套變動比例去掉幾乎相同的相鄰幀，超過上限時沿時間軸平均挑選。
-5. 另存寬 800px 的 JPG 縮圖給 AI 看；可選擇用 Windows OCR 取圖內文字。
-6. 輸出 frames.json。
+5. 另存寬 800px 的 JPG 縮圖給 AI 看；可選擇用 Windows OCR 取圖內文字與每行的文字框。
+6. 檢查錄影品質（實際幀率、畫面凍結），有問題只警告不中斷，寫進 frames.json 的 warnings。
+7. 輸出 frames.json。
 
 開始前檢查 ffmpeg／ffprobe 是否存在、輸入是不是影片、長度是否超過上限（超過 exit 2）。
 輸出資料夾已存在時不覆蓋，自動改用 <名稱>_2、_3…。
@@ -114,8 +115,9 @@ def change_ratio(a: np.ndarray, b: np.ndarray) -> float:
     return float((np.abs(a.astype(np.int16) - b.astype(np.int16)) > PIXEL_DELTA).mean())
 
 
-def detect_scenes(video: Path, sample_fps: float, threshold: float, settle: float, duration: float) -> list[float]:
-    """回傳畫面切換後、穩定下來的時間點（秒），含第 0 秒。"""
+def detect_scenes(video: Path, sample_fps: float, threshold: float, settle: float,
+                  duration: float) -> tuple[list[float], list[float]]:
+    """回傳（畫面切換後穩定下來的時間點（秒，含第 0 秒）、相鄰取樣的變動比例）。"""
     proc = subprocess.run(
         ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-i", str(video), "-an",
          "-vf", f"fps={sample_fps},scale={SIG_W}:{SIG_H},format=gray", "-f", "rawvideo", "-"],
@@ -128,7 +130,8 @@ def detect_scenes(video: Path, sample_fps: float, threshold: float, settle: floa
         raise ExtractError("ffmpeg 沒有解出任何畫面，影片可能損毀")
     samples = np.frombuffer(proc.stdout[: n * SIG_W * SIG_H], dtype=np.uint8).reshape(n, SIG_H, SIG_W)
 
-    changed = [change_ratio(samples[i - 1], samples[i]) >= threshold for i in range(1, n)]
+    ratios = [change_ratio(samples[i - 1], samples[i]) for i in range(1, n)]
+    changed = [r >= threshold for r in ratios]
     times = [0.0]
     i = 0
     while i < len(changed):
@@ -141,7 +144,84 @@ def detect_scenes(video: Path, sample_fps: float, threshold: float, settle: floa
             i = j + 1
         else:
             i += 1
-    return times
+    return times, ratios
+
+
+GAMEBAR_HINT = ("可能原因：Xbox Game Bar 預設不錄滑鼠游標、只錄單一應用程式視窗，"
+                "切換視窗或電腦效能不足時畫面會凍結、掉幀。"
+                "建議改用剪取工具（Win+Shift+R）或 OBS Studio 重錄。")
+FREEZE_MIN_RUN = 3.0  # 秒；短於此的靜止（操作者照建議停 1–2 秒）不列為凍結區段，避免誤報
+
+
+def parse_rate(text: str | None) -> float:
+    """把 ffprobe 的 "60/1"、"30000/1001" 轉成數字；讀不到回傳 0。"""
+    if not text or "/" not in text:
+        return 0.0
+    num, den = text.split("/", 1)
+    try:
+        return float(num) / float(den) if float(den) else 0.0
+    except ValueError:
+        return 0.0
+
+
+def check_fps(video: Path, duration: float) -> tuple[dict | None, str | None]:
+    """回傳（low_fps 警告或 None、無法檢查時的說明或 None）。實際 fps＝封包數 ÷ 長度。"""
+    proc = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+                "-show_entries", "stream=nb_read_packets,r_frame_rate,avg_frame_rate", "-of", "json", str(video)])
+    streams = json.loads(proc.stdout).get("streams") or []
+    if not streams:
+        return None, "ffprobe 沒有回傳視訊軌資訊，無法檢查幀率"
+    st = streams[0]
+    nominal = parse_rate(st.get("r_frame_rate")) or parse_rate(st.get("avg_frame_rate"))
+    try:
+        packets = int(st.get("nb_read_packets") or 0)
+    except ValueError:
+        packets = 0
+    if nominal <= 0 or packets <= 0:
+        return None, (f"讀不到標稱幀率或封包數（r_frame_rate={st.get('r_frame_rate')}，"
+                      f"nb_read_packets={st.get('nb_read_packets')}），無法檢查幀率")
+    actual = packets / duration
+    if actual >= nominal * 0.5:
+        return None, None
+    return {
+        "type": "low_fps",
+        "message": (f"實際幀率只有 {actual:.1f} fps（{packets} 幀 ÷ {duration:.1f} 秒），"
+                    f"不到標稱 {nominal:g} fps 的一半，錄影可能掉幀、畫面卡頓。{GAMEBAR_HINT}"),
+        "nominal_fps": round(nominal, 3), "actual_fps": round(actual, 2),
+        "packets": packets, "duration": round(duration, 2),
+    }, None
+
+
+def check_freeze(ratios: list[float], sample_fps: float, duration: float, freeze_seconds: float) -> dict | None:
+    """找變動比例＝0 的連續區段（至少 FREEZE_MIN_RUN 秒）；最長 ≥ freeze_seconds 或總長 ≥ 影片一半就警告。"""
+    segments = []
+    i = 0
+    while i < len(ratios):
+        if ratios[i] == 0:
+            j = i
+            while j + 1 < len(ratios) and ratios[j + 1] == 0:
+                j += 1
+            start, end = i / sample_fps, (j + 1) / sample_fps  # 取樣 i 到 j+1 之間完全沒變
+            if end - start >= FREEZE_MIN_RUN:
+                segments.append((start, end))
+            i = j + 1
+        else:
+            i += 1
+    if not segments:
+        return None
+    longest = max(e - s for s, e in segments)
+    total = sum(e - s for s, e in segments)
+    if longest < freeze_seconds and total < duration * 0.5:
+        return None
+    listed = "、".join(f"{timecode(s)}–{timecode(e)}" for s, e in segments)
+    return {
+        "type": "freeze",
+        "message": (f"畫面完全靜止的區段共 {total:.1f} 秒（佔影片 {total / duration:.0%}），"
+                    f"最長一段 {longest:.1f} 秒：{listed}。錄影可能凍結，或沒有錄到操作與滑鼠游標。{GAMEBAR_HINT}"),
+        "longest_seconds": round(longest, 2), "total_seconds": round(total, 2),
+        "segments": [{"start": round(s, 2), "end": round(e, 2), "start_tc": timecode(s), "end_tc": timecode(e)}
+                     for s, e in segments],
+    }
 
 
 def grab_frame(video: Path, t: float, dest: Path) -> None:
@@ -161,16 +241,28 @@ def timecode(t: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def run_ocr(paths: list[Path], lang: str) -> list[str]:
+CJK_SPACE = re.compile(r"(?<=[⺀-鿿＀-￯])\s+(?=[⺀-鿿＀-￯])")
+
+
+def strip_cjk_spaces(text: str) -> str:
+    """中文 OCR 會在每個字之間插空白，去掉中日韓字元之間的空白。"""
+    return CJK_SPACE.sub("", text)
+
+
+def run_ocr(paths: list[Path], lang: str) -> list[tuple[str, list[dict]]]:
+    """回傳每張圖的（全文、每行文字與文字框 [{text, x, y, w, h}]，原圖座標）。"""
     ps = shutil.which("powershell") or shutil.which("pwsh")
     if not ps:
         raise ExtractError("找不到 PowerShell，無法使用 --ocr（Windows OCR 僅限 Windows）")
     proc = run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT_DIR / "ocr.ps1"),
                 "-Lang", lang, *[str(p) for p in paths]])
     data = json.loads(proc.stdout)
-    texts = [d["text"] for d in data]
-    # 中文 OCR 會在每個字之間插空白，去掉中日韓字元之間的空白
-    return [re.sub(r"(?<=[⺀-鿿＀-￯])\s+(?=[⺀-鿿＀-￯])", "", t) for t in texts]
+    out = []
+    for d in data:
+        lines = [{"text": strip_cjk_spaces(ln["text"]), "x": int(ln["x"]), "y": int(ln["y"]),
+                  "w": int(ln["w"]), "h": int(ln["h"])} for ln in (d.get("lines") or [])]
+        out.append((strip_cjk_spaces(d["text"]), lines))
+    return out
 
 
 def main() -> int:
@@ -192,6 +284,8 @@ def main() -> int:
     ap.add_argument("--max-minutes", type=float, default=15,
                     help="影片超過幾分鐘就停下來（exit 2），請操作者決定分段或加 --allow-long（預設 15）")
     ap.add_argument("--allow-long", action="store_true", help="確認要處理超過 --max-minutes 的長影片")
+    ap.add_argument("--freeze-seconds", type=float, default=10,
+                    help="畫面完全靜止的連續區段達幾秒就發出凍結警告（預設 10）")
     args = ap.parse_args()
 
     require_ffmpeg()
@@ -224,7 +318,14 @@ def main() -> int:
     try:
         for d in (img_dir, thumb_dir, raw_dir):
             d.mkdir()
-        scenes = detect_scenes(video, args.sample_fps, args.scene, args.settle, duration)
+        scenes, ratios = detect_scenes(video, args.sample_fps, args.scene, args.settle, duration)
+        warnings = []
+        fps_warning, fps_skip = check_fps(video, duration)
+        if fps_warning:
+            warnings.append(fps_warning)
+        freeze_warning = check_freeze(ratios, args.sample_fps, duration, args.freeze_seconds)
+        if freeze_warning:
+            warnings.append(freeze_warning)
         candidates = [(t, "scene") for t in scenes]
         if len(scenes) - 1 < args.min_scenes:  # 扣掉第 0 秒
             t = args.interval
@@ -279,17 +380,19 @@ def main() -> int:
         shutil.rmtree(raw_dir)
 
         if args.ocr:
-            texts = run_ocr([out / f["image"] for f in frames], args.ocr_lang)
-            if len(texts) != len(frames):
-                raise ExtractError(f"OCR 回傳筆數 {len(texts)} 與畫面數 {len(frames)} 不符")
-            for f, t in zip(frames, texts):
-                f["ocr"] = t
+            ocr_results = run_ocr([out / f["image"] for f in frames], args.ocr_lang)
+            if len(ocr_results) != len(frames):
+                raise ExtractError(f"OCR 回傳筆數 {len(ocr_results)} 與畫面數 {len(frames)} 不符")
+            for f, (text, lines) in zip(frames, ocr_results):
+                f["ocr"] = text
+                f["ocr_lines"] = lines
 
         result = {
             "video": args.video, "out": out_record, "duration": round(duration, 2),
             "width": width, "height": height,
             "scene_changes": len(scenes) - 1, "candidates": len(candidates),
-            "dropped_duplicates": dropped_dupes, "dropped_over_limit": dropped_over_limit, "frames": frames,
+            "dropped_duplicates": dropped_dupes, "dropped_over_limit": dropped_over_limit,
+            "warnings": warnings, "frames": frames,
         }
         (out / "frames.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     except BaseException:
@@ -307,6 +410,11 @@ def main() -> int:
     for f in frames:
         print(f"  {f['index']:>2}. [{f['timecode']}] {f['thumb']}（{f['source']}）")
     print(f"已輸出：{out / 'frames.json'}")
+    if fps_skip:
+        print(f"注意：{fps_skip}")
+    for w in warnings:
+        print()
+        print(f"⚠ 錄影品質警告（{w['type']}）：{w['message']}")
     return 0
 
 

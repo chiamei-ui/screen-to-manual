@@ -1,4 +1,6 @@
-﻿# 以 Windows 內建 OCR（Windows.Media.Ocr）讀取圖片文字，輸出 JSON：[{ "path": ..., "text": ... }]
+﻿# 以 Windows 內建 OCR（Windows.Media.Ocr）讀取圖片文字，輸出 JSON：
+# [{ "path": ..., "text": ..., "lines": [{ "text", "x", "y", "w", "h" }] }]
+# lines 的座標是該行所有字詞 BoundingRect 的聯集（原圖像素座標，整數）
 # 用法：powershell -NoProfile -ExecutionPolicy Bypass -File ocr.ps1 -Lang zh-Hant-TW img1.png img2.png
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -39,11 +41,26 @@ foreach ($p in $Paths) {
         $decoder = Wait-WinRt ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
         $bitmap = Wait-WinRt ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
         $ocr = Wait-WinRt ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-        $lines = @($ocr.Lines | ForEach-Object { $_.Text })
-        $results += [pscustomobject]@{ path = $p; text = ($lines -join "`n") }
+        $lineBoxes = @()
+        foreach ($line in $ocr.Lines) {
+            $words = @($line.Words)
+            if ($words.Count -eq 0) { throw "OCR 行沒有任何字詞，無法計算文字框：$p「$($line.Text)」" }
+            $x1 = [double]::MaxValue; $y1 = [double]::MaxValue; $x2 = [double]::MinValue; $y2 = [double]::MinValue
+            foreach ($w in $words) {
+                $r = $w.BoundingRect
+                $x1 = [Math]::Min($x1, $r.X); $y1 = [Math]::Min($y1, $r.Y)
+                $x2 = [Math]::Max($x2, $r.X + $r.Width); $y2 = [Math]::Max($y2, $r.Y + $r.Height)
+            }
+            $bx = [int][Math]::Floor($x1); $by = [int][Math]::Floor($y1)
+            $lineBoxes += [pscustomobject]@{
+                text = $line.Text; x = $bx; y = $by
+                w = [int][Math]::Ceiling($x2) - $bx; h = [int][Math]::Ceiling($y2) - $by
+            }
+        }
+        $results += [pscustomobject]@{ path = $p; text = (@($lineBoxes | ForEach-Object { $_.text }) -join "`n"); lines = @($lineBoxes) }
     }
     finally {
         $stream.Dispose()
     }
 }
-ConvertTo-Json -InputObject @($results) -Depth 3 -Compress
+ConvertTo-Json -InputObject @($results) -Depth 5 -Compress

@@ -3,18 +3,23 @@
 steps.json 格式：
 {
   "title": "手冊標題",
+  "author": "製作者名稱",             # 必填，顯示在標題下並寫進 PDF 檔案屬性
+  "created_at": "2026-11-27 14:30",   # 選填，YYYY-MM-DD HH:MM；沒填用產出當下的本地時間
   "audience": "同事",                 # 選填，顯示在標題下
   "intro": "這份手冊說明……",         # 選填
   "steps": [
     {"text": "點選右上角的「新增」", "image": "images/frame_01.png"},
     {"text": "沒有圖的步驟也可以"}
   ],
-  "notes": ["注意事項一", "注意事項二"]  # 選填
+  "notes": ["注意事項一", "注意事項二"],  # 選填
+  "privacy_checked": true              # 必填：操作者已明確回答過敏感資訊遮蔽確認
 }
 image 路徑相對於 steps.json 所在資料夾。
+privacy_checked 不是 true、或遮蔽狀態不一致（有 images_original/ 卻沒有 masks_applied.json）時報錯，不產出任何檔案。
 
 manual.md 用相對路徑引用 images/；manual.html 把圖片以 base64 內嵌，單一檔案即可傳給同事。
 manual.pdf 由本機 Edge 或 Chrome 以 headless 模式列印 manual.html 產生；加 --no-pdf 可略過。
+瀏覽器列印不會帶入作者，產出後以「增量更新」在 PDF 尾端附加新的 Info 物件（Title、Author）與 trailer（/Prev 指回原 xref）。
 """
 from __future__ import annotations
 
@@ -24,10 +29,12 @@ import html
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 
@@ -74,13 +81,31 @@ def load_steps(path: Path) -> dict:
         raise BuildError("steps 檔最外層必須是物件 {...}，不是陣列或其他型別")
     if not str(data.get("title", "")).strip():
         raise BuildError("steps 檔缺少 title")
+    author = data.get("author")
+    if not isinstance(author, str) or not author.strip():
+        raise BuildError("steps 檔缺少 author（製作者名稱），請先問操作者後填入，例如 \"author\": \"王小明\"")
+    created_at = data.get("created_at")
+    if created_at is None:
+        data["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    elif not isinstance(created_at, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", created_at):
+        raise BuildError(f"created_at 格式必須是 YYYY-MM-DD HH:MM，目前是：{created_at!r}（不填則用產出當下時間）")
     steps = data.get("steps")
     if not isinstance(steps, list) or not steps:
         raise BuildError("steps 檔沒有任何步驟（steps 為空），不產出空手冊")
     notes = data.get("notes")
     if notes is not None and not (isinstance(notes, list) and all(isinstance(n, str) for n in notes)):
         raise BuildError("notes 必須是字串陣列，例如 [\"注意事項一\"]")
+    if data.get("privacy_checked") is not True:
+        raise BuildError("尚未完成敏感資訊遮蔽確認，請先問操作者截圖裡有沒有要遮蔽的敏感資訊，"
+                         "操作者明確回答後在 steps.json 設 \"privacy_checked\": true 再重跑")
     base = path.parent
+    has_orig, has_applied = (base / "images_original").is_dir(), (base / "masks_applied.json").is_file()
+    if has_orig and not has_applied:
+        raise BuildError(f"遮蔽狀態不一致：有 images_original 資料夾但沒有 masks_applied.json（{base}）。"
+                         "請重跑 mask_regions.py 套用遮蔽，或用 --restore 還原後再組手冊")
+    if has_applied and not has_orig:
+        raise BuildError(f"遮蔽狀態不一致：有 masks_applied.json 但沒有 images_original 資料夾（{base}）。"
+                         "原圖備份不見了，請確認 images 資料夾裡的圖是否已遮蔽，處理後再組手冊")
     for i, s in enumerate(steps, 1):
         if not isinstance(s, dict):
             raise BuildError(f"第 {i} 步必須是物件 {{\"text\": ..., \"image\": ...}}，不是 {type(s).__name__}")
@@ -91,8 +116,13 @@ def load_steps(path: Path) -> dict:
     return data
 
 
+def byline(data: dict) -> str:
+    return f"製作：{data['author']}｜製作時間：{data['created_at']}"
+
+
 def build_md(data: dict) -> str:
     lines = [f"# {data['title']}", ""]
+    lines += [f"> {byline(data)}", ""]
     if data.get("audience"):
         lines += [f"> 讀者：{data['audience']}", ""]
     if data.get("intro"):
@@ -119,6 +149,7 @@ def build_html(data: dict, base: Path) -> str:
         f"<title>{e(data['title'])}</title>", f"<style>{CSS}</style>", "</head>", "<body>", "<main>",
         f"<header><h1>{e(data['title'])}</h1>",
     ]
+    parts.append(f'<p class="meta">{e(byline(data))}</p>')
     if data.get("audience"):
         parts.append(f'<p class="meta">讀者：{e(data["audience"])}</p>')
     parts.append("</header>")
@@ -164,9 +195,125 @@ def find_browser() -> str | None:
 PDF_TIMEOUT = 120  # 秒
 
 
-def build_pdf(html_path: Path, pdf_path: Path) -> str:
+def locked_error(pdf_path: Path) -> BuildError:
+    return BuildError(f"manual.pdf 正在被其他程式開啟，請先關閉 PDF 再重跑：{pdf_path}")
+
+
+def is_locked(pdf_path: Path) -> bool:
+    """檔案存在但無法以寫入方式開啟，視為被其他程式鎖定。"""
+    if not pdf_path.exists():
+        return False
+    try:
+        with pdf_path.open("ab"):
+            return False
+    except PermissionError:
+        return True
+
+
+def pdf_string(text: str) -> bytes:
+    """PDF 文字字串：一律用 UTF-16BE（含 BOM）的十六進位寫法，中文與特殊字元都不必跳脫。"""
+    return b"<FEFF" + text.encode("utf-16-be").hex().upper().encode("ascii") + b">"
+
+
+def read_literal(buf: bytes, i: int) -> int:
+    """buf[i] 是 "("，回傳對應 ")" 之後的位置（處理巢狀括號與反斜線跳脫）。"""
+    depth = 0
+    while i < len(buf):
+        c = buf[i:i + 1]
+        if c == b"\\":
+            i += 2
+            continue
+        if c == b"(":
+            depth += 1
+        elif c == b")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise BuildError("PDF Info 字串沒有結尾的右括號")
+
+
+def parse_simple_dict(body: bytes) -> list[tuple[bytes, bytes]]:
+    """解析只含「/Key 值」的平面字典（Info 物件），值可為 (文字)、<十六進位>、名稱或數字。"""
+    items, i = [], 0
+    while True:
+        m = re.compile(rb"\s*/([^\s/<>()\[\]]+)\s*").match(body, i)
+        if not m:
+            if body[i:].strip():
+                raise BuildError(f"無法解析 PDF Info 字典：{body[i:i + 80]!r}")
+            return items
+        key, i = m.group(1), m.end()
+        if body[i:i + 1] == b"(":
+            end = read_literal(body, i)
+        elif body[i:i + 1] == b"<":
+            end = body.index(b">", i) + 1
+        else:
+            vm = re.compile(rb"[^\s/]+(?:\s+\d+\s+R)?").match(body, i)
+            if not vm:
+                raise BuildError(f"無法解析 PDF Info 字典的值：/{key.decode('latin-1')}")
+            end = vm.end()
+        items.append((key, body[i:end]))
+        i = end
+
+
+def set_pdf_info(pdf_path: Path, title: str, author: str) -> None:
+    """以增量更新寫入 Title／Author：附加新 Info 物件、只含該物件的 xref 段與帶 /Prev 的 trailer。
+
+    Edge／Chrome（Skia）產出的是傳統 xref 表（"xref" 關鍵字＋"trailer" 字典），只支援這種；
+    遇到 xref stream（PDF 1.5 交叉參照串流）直接報錯，不默默略過。
+    """
+    pdf = pdf_path.read_bytes()
+    m = re.search(rb"startxref\s+(\d+)\s+%%EOF\s*$", pdf)
+    if not m:
+        raise BuildError(f"PDF 結尾找不到 startxref／%%EOF，無法寫入作者與標題：{pdf_path}")
+    prev = int(m.group(1))
+    if pdf[prev:prev + 4] != b"xref":
+        raise BuildError(f"PDF 使用 xref stream（不是傳統 xref 表），目前不支援寫入作者與標題：{pdf_path}")
+    t = pdf.rfind(b"trailer", prev, m.start())
+    if t < 0:
+        raise BuildError(f"PDF 找不到 trailer 字典：{pdf_path}")
+    trailer = pdf[t:m.start()]
+    size_m = re.search(rb"/Size\s+(\d+)", trailer)
+    root_m = re.search(rb"/Root\s+(\d+\s+\d+\s+R)", trailer)
+    if not size_m or not root_m:
+        raise BuildError(f"PDF trailer 缺少 /Size 或 /Root：{pdf_path}")
+    size = int(size_m.group(1))
+    id_m = re.search(rb"/ID\s*(\[[^\]]*\])", trailer)
+
+    # 保留原 Info 的其他欄位（Creator、Producer、CreationDate…），只換掉 Title／Author
+    kept: list[tuple[bytes, bytes]] = []
+    info_m = re.search(rb"/Info\s+(\d+)\s+(\d+)\s+R", trailer)
+    if info_m:
+        om = re.search(rb"(?<!\d)" + info_m.group(1) + rb"\s+" + info_m.group(2) + rb"\s+obj\s*<<(.*?)>>\s*endobj",
+                       pdf, re.S)
+        if not om:
+            raise BuildError(f"PDF 找不到原本的 Info 物件 {info_m.group(1).decode()} 0 obj：{pdf_path}")
+        kept = [(k, v) for k, v in parse_simple_dict(om.group(1)) if k not in (b"Title", b"Author")]
+    entries = [(b"Title", pdf_string(title)), (b"Author", pdf_string(author))] + kept
+    info_body = b"<<" + b"\n".join(b"/" + k + b" " + v for k, v in entries) + b">>"
+
+    sep = b"" if pdf.endswith(b"\n") else b"\n"
+    obj_offset = len(pdf) + len(sep)
+    obj = f"{size} 0 obj\n".encode() + info_body + b"\nendobj\n"
+    xref_offset = obj_offset + len(obj)
+    xref = f"xref\n{size} 1\n{obj_offset:010d} 00000 n \n".encode()  # 每筆固定 20 bytes
+    new_trailer = (f"trailer\n<</Size {size + 1}\n/Root ".encode() + root_m.group(1)
+                   + f"\n/Info {size} 0 R\n/Prev {prev}".encode()
+                   + ((b"\n/ID " + id_m.group(1)) if id_m else b"")
+                   + f">>\nstartxref\n{xref_offset}\n%%EOF\n".encode())
+    try:
+        with pdf_path.open("ab") as f:
+            f.write(sep + obj + xref + new_trailer)
+    except PermissionError as e:
+        raise locked_error(pdf_path) from e
+
+
+def build_pdf(html_path: Path, pdf_path: Path, title: str, author: str) -> str:
     if pdf_path.exists():
-        pdf_path.unlink()  # 先刪舊檔，避免找不到瀏覽器或列印失敗時留下內容過時的 PDF
+        try:
+            pdf_path.unlink()  # 先刪舊檔，避免找不到瀏覽器或列印失敗時留下內容過時的 PDF
+        except PermissionError as e:
+            raise locked_error(pdf_path) from e
     browser = find_browser()
     if not browser:
         raise BuildError(f"找不到 Edge 或 Chrome，無法產生 PDF。manual.md／manual.html 已產出：{html_path.parent}\n"
@@ -186,13 +333,22 @@ def build_pdf(html_path: Path, pdf_path: Path) -> str:
         except OSError as ce:  # 只是暫存設定檔沒刪掉，不影響結果，但要讓人知道
             print(f"警告：暫存資料夾沒刪乾淨，可手動刪除：{profile}（{ce}）", file=sys.stderr)
     if proc.returncode != 0:
+        if is_locked(pdf_path):
+            raise locked_error(pdf_path)
         tail = "\n".join((proc.stderr or "").strip().splitlines()[-10:])
         raise BuildError(f"瀏覽器列印 PDF 失敗（exit {proc.returncode}）：{browser}\n{tail}")
     if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
+        if is_locked(pdf_path):
+            raise locked_error(pdf_path)
         raise BuildError(f"瀏覽器執行完畢但沒有產出 PDF：{pdf_path}\n{(proc.stderr or '').strip()[-800:]}")
     with pdf_path.open("rb") as f:
         if f.read(4) != b"%PDF":
             raise BuildError(f"產出的檔案不是 PDF：{pdf_path}")
+    try:
+        set_pdf_info(pdf_path, title, author)
+    except BaseException:
+        pdf_path.unlink(missing_ok=True)  # 寫入屬性失敗就不留下缺標題／作者的 PDF，原錯誤照常拋出
+        raise
     return browser
 
 
@@ -206,6 +362,12 @@ def main() -> int:
     data = load_steps(steps_path)
     out = steps_path.parent
     md_path, html_path, pdf_path = out / "manual.md", out / "manual.html", out / "manual.pdf"
+    if not args.no_pdf and pdf_path.exists():
+        # 先刪舊 PDF：被其他程式開啟（鎖定）時在寫 md／html 之前就停下，避免新舊檔混在一起
+        try:
+            pdf_path.unlink()
+        except PermissionError as e:
+            raise locked_error(pdf_path) from e
     md_path.write_text(build_md(data), encoding="utf-8")
     html_path.write_text(build_html(data, out), encoding="utf-8")
     size_kb = html_path.stat().st_size / 1024
@@ -216,7 +378,7 @@ def main() -> int:
         if pdf_path.exists():
             print(f"注意：已指定 --no-pdf，資料夾內舊的 {pdf_path.name} 沒有更新，內容可能過時")
         return 0
-    browser = build_pdf(html_path, pdf_path)
+    browser = build_pdf(html_path, pdf_path, data["title"], data["author"])
     print(f"  {pdf_path}（{pdf_path.stat().st_size / 1024:.0f} KB，以 {Path(browser).name} 列印）")
     return 0
 

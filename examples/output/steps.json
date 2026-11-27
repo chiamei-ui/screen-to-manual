@@ -1,5 +1,7 @@
 {
   "title": "示範系統：新增訂單",
+  "author": "示範作者",
+  "created_at": "2026-11-27 10:00",
   "audience": "同事",
   "intro": "這份手冊示範如何在示範系統中新增一筆訂單。",
   "steps": [
@@ -9,5 +11,6 @@
     {"text": "填完表單後送出，系統跳出確認視窗。", "image": "images/frame_04.png"},
     {"text": "確認後出現完成畫面，訂單新增完成。", "image": "images/frame_05.png"}
   ],
-  "notes": ["本範例畫面為 ffmpeg 產生的測試影片，非真實系統。"]
+  "notes": ["本範例畫面為 ffmpeg 產生的測試影片，非真實系統。"],
+  "privacy_checked": true
 }

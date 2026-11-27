@@ -1,5 +1,6 @@
 ﻿# 偵測本機已安裝的螢幕錄影工具，輸出 JSON 陣列：
-# [{ name, found, evidence, how_to_record, save_location, note }]
+# [{ name, found, recommended, evidence, how_to_record, save_location, note }]
+# recommended 為 true 的工具（剪取工具）建議優先使用。
 # 用法：powershell -NoProfile -ExecutionPolicy Bypass -File detect_recorders.ps1
 # 偵測本身失敗（例如 Get-AppxPackage 拋錯）時直接報錯結束，不輸出不完整的結果。
 $ErrorActionPreference = "Stop"
@@ -64,11 +65,12 @@ function Find-Exe([string[]]$paths) {
     return $null
 }
 
-function New-Result($name, [string[]]$evidence, $how, $save, $note) {
+function New-Result($name, [string[]]$evidence, $how, $save, $note, [bool]$recommended = $false) {
     $ev = @($evidence | Where-Object { $_ })
     [pscustomobject]@{
         name          = $name
         found         = ($ev.Count -gt 0)
+        recommended   = $recommended
         evidence      = $(if ($ev.Count -gt 0) { $ev -join "；" } else { $null })
         how_to_record = $how
         save_location = $save
@@ -79,18 +81,18 @@ function New-Result($name, [string[]]$evidence, $how, $save, $note) {
 $results = @()
 
 # 剪取工具（Snipping Tool）
-$snipNote = "Windows 11（build 22000 以上）的剪取工具才有螢幕錄製功能；可錄整個螢幕或框選區域。若版本較舊，畫面上沒有錄影按鈕，需先到 Microsoft Store 更新剪取工具。若沒有開啟自動儲存，錄完要在預覽視窗按「另存新檔」手動存檔。"
+$snipNote = "推薦優先使用：可錄整個螢幕或框選區域，會錄到滑鼠游標，切換視窗也不受影響。Windows 11（build 22000 以上）的剪取工具才有螢幕錄製功能；若版本較舊，畫面上沒有錄影按鈕，需先到 Microsoft Store 更新剪取工具。若沒有開啟自動儲存，錄完要在預覽視窗按「另存新檔」手動存檔。"
 if ($build -lt 22000) { $snipNote = "此電腦為 build $build（低於 22000，不是 Windows 11），剪取工具不支援螢幕錄製。" + $snipNote }
 $results += New-Result "剪取工具（螢幕錄製）" @(Find-Appx "Microsoft.ScreenSketch") `
     "按 Win+Shift+R（較新版本支援）直接進入錄影；或從開始功能表開啟「剪取工具」，切換到錄影模式（攝影機圖示）→ 按「新增」→ 框選要錄的範圍 → 按「開始」；錄完按停止。" `
     (Join-Path $videos "Screen Recordings") `
-    $snipNote
+    $snipNote $true
 
 # Xbox Game Bar
 $results += New-Result "Xbox Game Bar" @(Find-Appx "Microsoft.XboxGamingOverlay") `
     "先點一下要錄的應用程式視窗，按 Win+Alt+R 開始錄影，再按一次 Win+Alt+R 停止；也可按 Win+G 開啟 Game Bar 後在「擷取」面板按錄製。" `
     (Join-Path $videos "Captures") `
-    "只能錄單一應用程式視窗，不能錄桌面與檔案總管，切換視窗後不會跟著錄；若要錄跨視窗操作請改用剪取工具或 OBS Studio。"
+    "預設不會錄到滑鼠游標，要先到「設定 → 遊戲 → 擷取」開啟「在錄製中擷取滑鼠游標」，否則看不出點了哪裡。只能錄單一應用程式視窗，不能錄桌面與檔案總管，切換視窗後不會跟著錄；切換視窗或電腦效能不足時畫面可能凍結、掉幀。若要錄跨視窗操作，或錄出來畫面卡住，請改用剪取工具（推薦）或 OBS Studio。"
 
 # Clipchamp
 $results += New-Result "Clipchamp" @(Find-Appx "Clipchamp.Clipchamp") `
