@@ -1,6 +1,9 @@
 {
-  "video": "test_video.mp4",
+  "video": "examples/test_video.mp4",
+  "out": "examples\\output",
   "duration": 15.0,
+  "width": 1280,
+  "height": 720,
   "scene_changes": 4,
   "candidates": 5,
   "dropped_duplicates": 0,

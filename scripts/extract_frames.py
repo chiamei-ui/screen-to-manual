@@ -10,7 +10,9 @@
 5. 另存寬 800px 的 JPG 縮圖給 AI 看；可選擇用 Windows OCR 取圖內文字。
 6. 輸出 frames.json。
 
-任何一步失敗都直接報錯結束，不產出殘缺結果。
+開始前檢查 ffmpeg／ffprobe 是否存在、輸入是不是影片、長度是否超過上限（超過 exit 2）。
+輸出資料夾已存在時不覆蓋，自動改用 <名稱>_2、_3…。
+任何一步失敗都直接報錯結束，並清掉本次新建的輸出資料夾，不產出殘缺結果。
 """
 from __future__ import annotations
 
@@ -29,7 +31,23 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class ExtractError(RuntimeError):
-    pass
+    exit_code = 1
+
+
+class TooLongError(ExtractError):
+    """影片超過長度上限：exit 2，讓呼叫端知道是「需要操作者決定」而不是壞掉。"""
+    exit_code = 2
+
+
+INSTALL_FFMPEG = ("安裝方法：\n"
+                  "  Windows：winget install Gyan.FFmpeg（裝完請關掉並重開終端機）\n"
+                  "  macOS：brew install ffmpeg")
+
+
+def require_ffmpeg() -> None:
+    missing = [exe for exe in ("ffmpeg", "ffprobe") if not shutil.which(exe)]
+    if missing:
+        raise ExtractError(f"找不到 {'、'.join(missing)}（不在 PATH 中），無法處理影片。\n{INSTALL_FFMPEG}")
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -43,18 +61,48 @@ def run(cmd: list[str]) -> subprocess.CompletedProcess:
     return proc
 
 
-def probe_duration(video: Path) -> float:
-    proc = run([
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=codec_type:format=duration", "-of", "json", str(video),
-    ])
+MIN_SIDE = 320  # 寬或高小於此值，多半不是螢幕錄影
+
+
+def probe_video(video: Path) -> tuple[float, int, int]:
+    """回傳（長度秒數、寬、高），取第一條視訊軌；不是影片就報錯。"""
+    try:
+        proc = run([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_type,width,height,duration:format=duration", "-of", "json", str(video),
+        ])
+    except ExtractError as e:
+        raise ExtractError(f"無法讀取，可能不是影片檔或檔案已損毀：{video}\n{e}") from e
     info = json.loads(proc.stdout)
-    if not info.get("streams"):
-        raise ExtractError(f"影片沒有視訊軌：{video}")
-    duration = float(info.get("format", {}).get("duration") or 0)
+    streams = info.get("streams") or []
+    if not streams:
+        raise ExtractError(f"沒有視訊軌，不是影片檔：{video}")
+    st = streams[0]
+    try:
+        duration = float(info.get("format", {}).get("duration") or st.get("duration") or 0)
+    except ValueError:
+        duration = 0.0
     if duration <= 0:
-        raise ExtractError(f"讀不到影片長度：{video}")
-    return duration
+        raise ExtractError(f"讀不到影片長度，可能不是影片檔（例如單張圖片）：{video}")
+    w, h = int(st.get("width") or 0), int(st.get("height") or 0)
+    if w < MIN_SIDE or h < MIN_SIDE:
+        raise ExtractError(f"解析度 {w}x{h} 太小（寬或高小於 {MIN_SIDE}），可能不是螢幕錄影：{video}")
+    return duration, w, h
+
+
+def make_out_dir(requested: Path) -> Path:
+    """建立輸出資料夾；已存在（不論是否為空）就不覆蓋，改用 <名稱>_2、_3…第一個不存在的。"""
+    candidate, n = requested, 1
+    while True:
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            # 上層路徑是檔案時也會拋 FileExistsError，此時 candidate 本身不存在，改名重試會無限迴圈
+            if not candidate.exists():
+                raise ExtractError(f"無法建立輸出資料夾（上層路徑可能是檔案而不是資料夾）：{candidate}")
+            n += 1
+            candidate = requested.with_name(f"{requested.name}_{n}")
 
 
 SIG_W, SIG_H = 160, 90
@@ -141,7 +189,12 @@ def main() -> int:
     ap.add_argument("--thumb-width", type=int, default=800, help="給 AI 看的縮圖寬度（預設 800）")
     ap.add_argument("--ocr", action="store_true", help="用 Windows 內建 OCR 讀取圖內文字，寫進 frames.json")
     ap.add_argument("--ocr-lang", default="zh-Hant-TW", help="OCR 語言（預設 zh-Hant-TW）")
+    ap.add_argument("--max-minutes", type=float, default=15,
+                    help="影片超過幾分鐘就停下來（exit 2），請操作者決定分段或加 --allow-long（預設 15）")
+    ap.add_argument("--allow-long", action="store_true", help="確認要處理超過 --max-minutes 的長影片")
     args = ap.parse_args()
+
+    require_ffmpeg()
 
     video = Path(args.video).resolve()
     if not video.is_file():
@@ -149,18 +202,28 @@ def main() -> int:
     if args.max_frames < 1:
         raise ExtractError("--max-frames 至少要 1")
 
-    duration = probe_duration(video)  # 先確認影片讀得到，再建立輸出資料夾
+    duration, width, height = probe_video(video)  # 先確認影片讀得到，再建立輸出資料夾
+    if duration > args.max_minutes * 60 and not args.allow_long:
+        raise TooLongError(
+            f"影片長度 {timecode(duration)}（{duration / 60:.1f} 分鐘），超過上限 {args.max_minutes:g} 分鐘。\n"
+            f"長影片抽出的畫面多、步驟容易漏，建議先分段，例如：\n"
+            f"  ffmpeg -ss 00:00:00 -to 00:10:00 -i 原檔 -c copy 片段1.mp4\n"
+            f"  ffmpeg -ss 00:10:00 -i 原檔 -c copy 片段2.mp4\n"
+            f"確定要整段處理，請加 --allow-long 重跑。")
 
-    out = Path(args.out).resolve()
+    requested = Path(args.out)
+    out_given = make_out_dir(requested.resolve())
+    if out_given.name != requested.resolve().name:
+        print(f"輸出資料夾已存在，改用：{out_given}")
+    out = out_given
+    # frames.json 記錄操作者給的寫法（相對或絕對）加上實際序號，不額外展開成本機絕對路徑
+    out_record = str(requested.with_name(out.name))
     img_dir, thumb_dir, raw_dir = out / "images", out / "thumbs", out / "_raw"
-    for d in (img_dir, thumb_dir):
-        if d.exists() and any(d.iterdir()):
-            raise ExtractError(f"輸出資料夾已有內容，為避免混到舊圖請換一個 --out：{d}")
-    for d in (img_dir, thumb_dir, raw_dir):
-        d.mkdir(parents=True, exist_ok=True)
 
-    # 之後任何一步失敗都清掉本次建立的資料夾（建立前已確認是空的），不留下殘缺結果
+    # 之後任何一步失敗都清掉本次新建的整個輸出資料夾，不留下殘缺結果
     try:
+        for d in (img_dir, thumb_dir, raw_dir):
+            d.mkdir()
         scenes = detect_scenes(video, args.sample_fps, args.scene, args.settle, duration)
         candidates = [(t, "scene") for t in scenes]
         if len(scenes) - 1 < args.min_scenes:  # 扣掉第 0 秒
@@ -223,14 +286,17 @@ def main() -> int:
                 f["ocr"] = t
 
         result = {
-            "video": args.video, "duration": round(duration, 2),
+            "video": args.video, "out": out_record, "duration": round(duration, 2),
+            "width": width, "height": height,
             "scene_changes": len(scenes) - 1, "candidates": len(candidates),
             "dropped_duplicates": dropped_dupes, "dropped_over_limit": dropped_over_limit, "frames": frames,
         }
         (out / "frames.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     except BaseException:
-        for d in (img_dir, thumb_dir, raw_dir):
-            shutil.rmtree(d, ignore_errors=True)
+        try:
+            shutil.rmtree(out)
+        except OSError as ce:  # 清理失敗要讓操作者知道，但不蓋掉原本的錯誤
+            print(f"警告：清不掉本次建立的輸出資料夾，請手動刪除：{out}（{ce}）", file=sys.stderr)
         raise
 
     print(f"影片長度 {duration:.1f}s，偵測到 {len(scenes) - 1} 次畫面切換，候選 {len(candidates)} 張，"
@@ -252,4 +318,8 @@ if __name__ == "__main__":
         sys.exit(main())
     except ExtractError as e:
         print(f"錯誤：{e}", file=sys.stderr)
+        sys.exit(e.exit_code)
+    except OSError as e:
+        where = e.filename or "（未知路徑）"
+        print(f"錯誤：讀寫檔案失敗：{where}（{e.strerror or e}）。請確認有寫入權限、磁碟空間足夠。", file=sys.stderr)
         sys.exit(1)

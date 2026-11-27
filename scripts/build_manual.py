@@ -14,6 +14,7 @@ steps.json 格式：
 image 路徑相對於 steps.json 所在資料夾。
 
 manual.md 用相對路徑引用 images/；manual.html 把圖片以 base64 內嵌，單一檔案即可傳給同事。
+manual.pdf 由本機 Edge 或 Chrome 以 headless 模式列印 manual.html 產生；加 --no-pdf 可略過。
 """
 from __future__ import annotations
 
@@ -22,7 +23,11 @@ import base64
 import html
 import json
 import mimetypes
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -47,7 +52,14 @@ h1 { margin:0; font-size:1.8rem; }
   font-family:"Inter",system-ui,sans-serif; font-size:.95rem; }
 .step img { display:block; max-width:100%; height:auto; border:1px solid #E2E2E2; border-radius:6px; }
 .notes h2 { margin:0 0 8px; font-size:1.1rem; color:var(--brand); }
-@media print { body { background:#fff; } .step { box-shadow:none; break-inside:avoid; } }
+@page { size: A4; margin: 12mm; }
+@media print {
+  html, body { background:#fff; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  main { max-width:none; padding:0; }
+  h1, h2, .step h2 { break-after:avoid; page-break-after:avoid; }
+  .step { box-shadow:none; border:1px solid #E2E2E2; break-inside:avoid; page-break-inside:avoid; }
+  .step img { max-height:200mm; width:auto; max-width:100%; margin:0 auto; }
+}
 """
 
 
@@ -124,20 +136,88 @@ def build_html(data: dict, base: Path) -> str:
     return "\n".join(parts)
 
 
+def find_browser() -> str | None:
+    """依序找 Edge、Chrome（Windows 安裝路徑 → PATH → macOS 應用程式）。"""
+    candidates = []
+    for env, sub in (("ProgramFiles(x86)", r"Microsoft\Edge\Application\msedge.exe"),
+                     ("ProgramFiles", r"Microsoft\Edge\Application\msedge.exe"),
+                     ("ProgramFiles", r"Google\Chrome\Application\chrome.exe"),
+                     ("ProgramFiles(x86)", r"Google\Chrome\Application\chrome.exe"),
+                     ("LOCALAPPDATA", r"Google\Chrome\Application\chrome.exe")):
+        base = os.environ.get(env)
+        if base:
+            candidates.append(Path(base) / sub)
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    for name in ("msedge", "chrome", "google-chrome", "chromium"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for mac in ("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"):
+        if Path(mac).is_file():
+            return mac
+    return None
+
+
+PDF_TIMEOUT = 120  # 秒
+
+
+def build_pdf(html_path: Path, pdf_path: Path) -> str:
+    if pdf_path.exists():
+        pdf_path.unlink()  # 先刪舊檔，避免找不到瀏覽器或列印失敗時留下內容過時的 PDF
+    browser = find_browser()
+    if not browser:
+        raise BuildError(f"找不到 Edge 或 Chrome，無法產生 PDF。manual.md／manual.html 已產出：{html_path.parent}\n"
+                         "要 PDF 請先安裝 Microsoft Edge 或 Google Chrome 後重跑；只要 HTML 可加 --no-pdf。")
+    # 一定要用獨立的暫存設定檔：使用者已開著同一個瀏覽器時，headless 會附掛到既有程序而不產檔
+    profile = tempfile.mkdtemp(prefix="screen-to-manual-pdf-")
+    cmd = [browser, "--headless=new", "--disable-gpu", "--no-pdf-header-footer", f"--user-data-dir={profile}",
+           f"--print-to-pdf={pdf_path}", html_path.as_uri()]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=PDF_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        raise BuildError(f"瀏覽器列印 PDF 超過 {PDF_TIMEOUT} 秒沒有完成：{browser}") from e
+    finally:
+        try:
+            shutil.rmtree(profile)
+        except OSError as ce:  # 只是暫存設定檔沒刪掉，不影響結果，但要讓人知道
+            print(f"警告：暫存資料夾沒刪乾淨，可手動刪除：{profile}（{ce}）", file=sys.stderr)
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stderr or "").strip().splitlines()[-10:])
+        raise BuildError(f"瀏覽器列印 PDF 失敗（exit {proc.returncode}）：{browser}\n{tail}")
+    if not pdf_path.is_file() or pdf_path.stat().st_size == 0:
+        raise BuildError(f"瀏覽器執行完畢但沒有產出 PDF：{pdf_path}\n{(proc.stderr or '').strip()[-800:]}")
+    with pdf_path.open("rb") as f:
+        if f.read(4) != b"%PDF":
+            raise BuildError(f"產出的檔案不是 PDF：{pdf_path}")
+    return browser
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="依 steps.json 產生 manual.md 與 manual.html")
+    ap = argparse.ArgumentParser(description="依 steps.json 產生 manual.md、manual.html 與 manual.pdf")
     ap.add_argument("steps", help="steps.json 路徑（輸出寫在同一個資料夾）")
+    ap.add_argument("--no-pdf", action="store_true", help="不產生 manual.pdf（只要 md 與 html）")
     args = ap.parse_args()
 
     steps_path = Path(args.steps).resolve()
     data = load_steps(steps_path)
     out = steps_path.parent
-    (out / "manual.md").write_text(build_md(data), encoding="utf-8")
-    (out / "manual.html").write_text(build_html(data, out), encoding="utf-8")
-    size_kb = (out / "manual.html").stat().st_size / 1024
+    md_path, html_path, pdf_path = out / "manual.md", out / "manual.html", out / "manual.pdf"
+    md_path.write_text(build_md(data), encoding="utf-8")
+    html_path.write_text(build_html(data, out), encoding="utf-8")
+    size_kb = html_path.stat().st_size / 1024
     print(f"已輸出 {len(data['steps'])} 個步驟：")
-    print(f"  {out / 'manual.md'}")
-    print(f"  {out / 'manual.html'}（單檔，圖片已內嵌，{size_kb:.0f} KB）")
+    print(f"  {md_path}")
+    print(f"  {html_path}（單檔，圖片已內嵌，{size_kb:.0f} KB）")
+    if args.no_pdf:
+        if pdf_path.exists():
+            print(f"注意：已指定 --no-pdf，資料夾內舊的 {pdf_path.name} 沒有更新，內容可能過時")
+        return 0
+    browser = build_pdf(html_path, pdf_path)
+    print(f"  {pdf_path}（{pdf_path.stat().st_size / 1024:.0f} KB，以 {Path(browser).name} 列印）")
     return 0
 
 
@@ -149,4 +229,8 @@ if __name__ == "__main__":
         sys.exit(main())
     except BuildError as e:
         print(f"錯誤：{e}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        where = e.filename or "（未知路徑）"
+        print(f"錯誤：讀寫檔案失敗：{where}（{e.strerror or e}）。請確認有寫入權限、磁碟空間足夠。", file=sys.stderr)
         sys.exit(1)
