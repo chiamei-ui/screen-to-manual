@@ -1,0 +1,65 @@
+{
+  "video": "test_video.mp4",
+  "duration": 15.0,
+  "scene_changes": 4,
+  "candidates": 5,
+  "dropped_duplicates": 0,
+  "dropped_over_limit": 0,
+  "frames": [
+    {
+      "index": 1,
+      "time": 0.0,
+      "timecode": "00:00",
+      "source": "scene",
+      "image": "images/frame_01.png",
+      "thumb": "thumbs/frame_01.jpg",
+      "width": 1280,
+      "height": 720,
+      "ocr": "卞範系統步驟 1 登入頁"
+    },
+    {
+      "index": 2,
+      "time": 3.3,
+      "timecode": "00:03",
+      "source": "scene",
+      "image": "images/frame_02.png",
+      "thumb": "thumbs/frame_02.jpg",
+      "width": 1280,
+      "height": 720,
+      "ocr": "卞範系統步驟 2 百頁儀表板"
+    },
+    {
+      "index": 3,
+      "time": 6.3,
+      "timecode": "00:06",
+      "source": "scene",
+      "image": "images/frame_03.png",
+      "thumb": "thumbs/frame_03.jpg",
+      "width": 1280,
+      "height": 720,
+      "ocr": "示範系統步驟 3 新增訂單表單"
+    },
+    {
+      "index": 4,
+      "time": 9.3,
+      "timecode": "00:09",
+      "source": "scene",
+      "image": "images/frame_04.png",
+      "thumb": "thumbs/frame_04.jpg",
+      "width": 1280,
+      "height": 720,
+      "ocr": "示範系統步 4 確認視窗"
+    },
+    {
+      "index": 5,
+      "time": 12.3,
+      "timecode": "00:12",
+      "source": "scene",
+      "image": "images/frame_05.png",
+      "thumb": "thumbs/frame_05.jpg",
+      "width": 1280,
+      "height": 720,
+      "ocr": "示範系統步馬聚 5 完成畫面"
+    }
+  ]
+}

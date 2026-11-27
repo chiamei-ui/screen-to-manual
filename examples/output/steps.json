@@ -1,0 +1,13 @@
+{
+  "title": "示範系統：新增訂單",
+  "audience": "同事",
+  "intro": "這份手冊示範如何在示範系統中新增一筆訂單。",
+  "steps": [
+    {"text": "開啟示範系統，進入登入頁。", "image": "images/frame_01.png"},
+    {"text": "登入後會看到首頁儀表板。", "image": "images/frame_02.png"},
+    {"text": "點選右下角橘色按鈕，開啟「新增訂單」表單。", "image": "images/frame_03.png"},
+    {"text": "填完表單後送出，系統跳出確認視窗。", "image": "images/frame_04.png"},
+    {"text": "確認後出現完成畫面，訂單新增完成。", "image": "images/frame_05.png"}
+  ],
+  "notes": ["本範例畫面為 ffmpeg 產生的測試影片，非真實系統。"]
+}
